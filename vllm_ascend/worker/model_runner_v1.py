@@ -2507,6 +2507,9 @@ class NPUModelRunner(GPUModelRunner):
                         mamba_copy_connector = connector
                 if mamba_copy_connector is None:
                     mamba_utils.do_mamba_copy_block(preprocess_bufs)
+            self._flush_decode_double_buffer_before_forward(
+                scheduler_output.total_num_scheduled_tokens
+            )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
@@ -3041,6 +3044,25 @@ class NPUModelRunner(GPUModelRunner):
                 self.vllm_config,
                 self.speculative_config,
             )
+    def _flush_decode_double_buffer_before_forward(self, num_new_tokens: int) -> None:
+        if not self.sparse_kv_offload_enabled:
+            return
+        self.sparse_kv_offload_manager.maybe_flush_decode_double_buffers(num_new_tokens)
+
+    def _rollback_decode_buffers_after_reject(
+        self,
+        sampler_output: SamplerOutput,
+        scheduler_output: "SchedulerOutput",
+    )->None:
+        if not self.sparse_kv_offload_enabled:
+            return
+        sampled = getattr(sampler_output, "sampled_token_ids", None)
+        if sampled is None:
+            return
+        accepted = int((sampled != -1).sum().item())
+        num_rejected = int(scheduler_output.total_num_scheduled_tokens) - accepted
+        if num_rejected > 0:
+            self.sparse_kv_offload_manager.rollback_decode_double_buffers(num_rejected)
 
     def _model_forward(
         self,

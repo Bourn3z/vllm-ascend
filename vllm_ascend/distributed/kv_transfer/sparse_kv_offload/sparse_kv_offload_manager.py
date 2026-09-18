@@ -771,6 +771,9 @@ class SparseKVOffloadManager:
             )
         self.token_size_bytes_k = kv_head_num * head_dim_k * dtype.itemsize
         self.token_size_bytes_v = kv_head_num * head_dim_v * dtype.itemsize
+        self._init_decode_double_buffer(device=self.topk_buffers_k[0].device,
+                                        kv_lora_rank=head_dim_k,
+                                        qk_rope_head_dim=head_dim_v)
         if self.topk_buffer_size % self.block_size != 0:
             raise ValueError(
                 "Sparse KV offload topk_buffer_size must be divisible by "
@@ -1089,6 +1092,269 @@ class SparseKVOffloadManager:
         result = offload.sparse_copy(sources, destinations, lengths, count, sources.device)
         if result not in (None, 0):
             raise RuntimeError(f"memfabric nano tail H2D failed with result={result}")
+
+    # ------------------------------------------------------------------ #
+    # Decode double-buffer KV staging (D node, "pierce" scope).
+    #
+    # Two on-device block caches (k_pe + k_nope each) per layer, addressed by
+    # buffer-local slots, are filled by the fused `npu_kv_rmsnorm_rope_cache`
+    # kernel. When the active cache can no longer hold the next step, its whole
+    # content is flushed to the host pool on a SIDE STREAM (non-blocking) while
+    # the OTHER cache keeps filling, then the caches swap (ping-pong).
+    #
+    # Batching model mirrors tests/.../test_exec_kv_progression.py L6: the number
+    # of D2H calls drops from one-per-token-step to one-per-flush (~ capacity /
+    # tokens-per-step). This pierce validates the mechanism in isolation; LIM
+    # interactivity that must observe staged (not-yet-D2H) KV and CUDAGraph
+    # replay are documented follow-ups (see D2H_BLOCK_DOUBLE_BUFFER_REQUIREMENTS.md).
+    # ------------------------------------------------------------------ #
+    def decode_double_buffer_enabled(self) -> bool:
+        return getattr(self.sparse_kv_offload_config, "decode_kv_offload_mode", "immediate") == "double_buffer"
+
+    def _init_decode_double_buffer(
+        self,
+        device: torch.device,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+    ) -> None:
+        """Allocate per-layer double-buffer staging caches (no-op if disabled).
+
+        Runs during `register_kv_caches` (eager model init), so allocating a
+        dedicated side stream here is safe; the forward-time flush is guarded to
+        eager only. Each layer gets two PA_BSND caches
+        ``[num_staging_blocks, block_size, 1, D]`` for k_nope (D=kv_lora_rank)
+        and k_pe (D=qk_rope_head_dim), plus a device tensor of the host slots the
+        staged rows must be D2H'd into.
+        """
+        if not self.decode_double_buffer_enabled():
+            return
+        cfg = self.sparse_kv_offload_config
+        num_blocks = int(cfg.decode_kv_staging_num_blocks)
+        capacity = num_blocks * self.block_size
+        dtype = self.topk_buffers_k[0].dtype if self.topk_buffers_k else torch.bfloat16
+
+        self._db_num_blocks = num_blocks
+        self._db_capacity = capacity
+        self._db_k_nope: list[list[torch.Tensor]] = []
+        self._db_k_pe: list[list[torch.Tensor]] = []
+        self._db_host_slots: list[list[torch.Tensor]] = []
+        self._db_fill: list[int] = []
+        self._db_active: list[int] = []
+        self._db_done: list[list[torch.npu.Event]] = []
+        self._db_pending: list[list[bool]] = []
+        # Private MemFabric D2H scatter descriptors (one flush writes up to
+        # capacity tokens x 2 components K+V). Kept separate from the shared
+        # `d2h_*_npu` buffers used by `offload_new_kv` (immediate mode) so the
+        # asynchronous double-buffer flush never races another consumer.
+        self._db_device = device
+        self._db_d2h_src_ptrs = torch.empty(2 * capacity, dtype=torch.int64, device=device)
+        self._db_d2h_dst_ptrs = torch.empty(2 * capacity, dtype=torch.int64, device=device)
+        self._db_d2h_lengths = torch.empty(2 * capacity, dtype=torch.int32, device=device)
+        self._db_d2h_size = torch.empty(1, dtype=torch.int32, device=device)
+        self._db_token_indices = torch.arange(capacity, dtype=torch.int64, device=device)
+
+        for _layer_id in range(self.num_layers):
+            nope_pair = [
+                torch.zeros(num_blocks, self.block_size, 1, kv_lora_rank,
+                            dtype=dtype, device=device)
+                for _ in range(2)
+            ]
+            pe_pair = [
+                torch.zeros(num_blocks, self.block_size, 1, qk_rope_head_dim,
+                            dtype=dtype, device=device)
+                for _ in range(2)
+            ]
+            slots_pair = [
+                torch.full((capacity,), -1, dtype=torch.int64, device=device)
+                for _ in range(2)
+            ]
+            self._db_k_nope.append(nope_pair)
+            self._db_k_pe.append(pe_pair)
+            self._db_host_slots.append(slots_pair)
+            self._db_fill.append(0)
+            self._db_active.append(0)
+            self._db_done.append([torch.npu.Event(), torch.npu.Event()])
+            self._db_pending.append([False, False])
+
+        self._db_stream = torch.npu.Stream()
+        logger.info(
+            "Sparse KV offload decode double-buffer enabled: %s layers x 2 caches "
+            "of %s blocks (%s tokens) each; side-stream D2H staging.",
+            self.num_layers, num_blocks, capacity,
+        )
+
+    def _db_active_cache(self, layer_id: int) -> tuple[int, int]:
+        """Return (active cache index, tokens currently filled in it)."""
+        return self._db_active[layer_id], self._db_fill[layer_id]
+
+    def _db_flush(self, layer_id: int) -> None:
+        """Flush the active cache's filled rows to the host pool (TP0 only) on
+        the side stream (non-blocking), then ping-pong to the other cache and
+        (if the reuse target's earlier flush is still pending) wait on compute.
+
+        The D2H is a MemFabric `offload.sparse_copy` scatter: built from per-token
+        src/dst addresses, so it supports arbitrary host slots and runs at full
+        D2H bandwidth (see bench_host_pool_sparse_write.py — ~50x faster than
+        index_copy_, ~400x faster than a per-row copy_ loop)."""
+        active, fill = self._db_active_cache(layer_id)
+        if fill <= 0:
+            return
+        if self.tp_rank == 0:
+            k_cpu = self.k_caches_cpu[layer_id]
+            v_cpu = self.v_caches_cpu[layer_id]
+            active_nope = self._db_k_nope[layer_id][active]
+            active_pe = self._db_k_pe[layer_id][active]
+            slots = self._db_host_slots[layer_id][active][:fill]
+            # Per-token byte strides come from the staged cache's own last dim
+            # (k_nope head_dim_k, k_pe head_dim_v) — identical to the host pool's
+            # flat row stride by construction, and robust when the manager object
+            # is driven directly (bypassing register_kv_caches token_size_bytes).
+            tsize_k = active_nope.shape[-1] * active_nope.element_size()
+            tsize_v = active_pe.shape[-1] * active_pe.element_size()
+            # K pool holds k_nope (KV_LORA_RANK); V pool holds k_pe (rope dim).
+            idx = self._db_token_indices[:fill]
+            src_k = int(active_nope.data_ptr()) + idx * tsize_k
+            src_v = int(active_pe.data_ptr()) + idx * tsize_v
+            dst_k = int(k_cpu.data_ptr()) + slots * tsize_k
+            dst_v = int(v_cpu.data_ptr()) + slots * tsize_v
+            self._db_d2h_src_ptrs[:fill].copy_(src_k)
+            self._db_d2h_src_ptrs[fill:2 * fill].copy_(src_v)
+            self._db_d2h_dst_ptrs[:fill].copy_(dst_k)
+            self._db_d2h_dst_ptrs[fill:2 * fill].copy_(dst_v)
+            self._db_d2h_lengths[:fill].fill_(tsize_k)
+            self._db_d2h_lengths[fill:2 * fill].fill_(tsize_v)
+            self._db_d2h_size.fill_(2 * fill)
+            compute = torch.npu.current_stream()  # capture BEFORE entering the side stream
+            with torch.npu.stream(self._db_stream):
+                self._db_stream.wait_stream(compute)
+                result = offload.sparse_copy(
+                    self._db_d2h_src_ptrs,
+                    self._db_d2h_dst_ptrs,
+                    self._db_d2h_lengths,
+                    self._db_d2h_size,
+                    self._db_device,
+                )
+                if result not in (None, 0):
+                    raise RuntimeError(f"memfabric D2H sparse_copy failed with result={result}")
+            self._db_done[layer_id][active].record(self._db_stream)
+            self._db_pending[layer_id][active] = True
+
+        # Ping-pong: the newly-free (active) cache is armed for the next fill.
+        dest = 1 - active
+        if self.tp_rank == 0 and self._db_pending[layer_id][dest]:
+            # The cache we are about to fill was flushed last round; make sure
+            # that D2H finished before we overwrite it with new compute.
+            torch.npu.current_stream().wait_event(self._db_done[layer_id][dest])
+            self._db_pending[layer_id][dest] = False
+        self._db_active[layer_id] = dest
+        self._db_fill[layer_id] = 0
+
+    def offload_decode_kv_double_buffer(
+        self,
+        layer_id: int,
+        kv_no_split: torch.Tensor,
+        norm_weight: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        host_slots: torch.Tensor,
+        num_kv_heads: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        variance_epsilon: float,
+    ) -> None:
+        """Stage one decode step's K/V with the fused kernel into the on-device
+        double buffers flagged, flushing via ping-pong when the active cache is
+        full. `host_slots` are the host-pool slot per token (D2H destination)."""
+        if not self.decode_double_buffer_enabled():
+            raise RuntimeError("decode double-buffer staging not initialized")
+        tokens = int(kv_no_split.shape[0])
+        if host_slots.numel() != tokens:
+            raise ValueError(
+                "decode double-buffer host_slots length must equal token count, "
+                f"got {host_slots.numel()} vs {tokens}"
+            )
+        active, fill = self._db_active_cache(layer_id)
+        # Primary flush is driven by the model runner BEFORE each forward
+        # (`maybe_flush_decode_double_buffers`); this internal check is only a
+        # defensive fallback for the unlikely case a single step exceeds the
+        # whole cache (a batch must fit in one cache between runner flushes).
+        if fill + tokens > self._db_capacity:
+            self._db_flush(layer_id)
+            active, fill = self._db_active_cache(layer_id)
+
+        # Fused compute + save into the active block cache at buffer-local slots
+        # (PA layout, as in sfa_v1.exec_kv). Produces k_pe -> k_pe block and
+        # k_nope -> k_nope block, addressed by slot = fill + token index.
+        kvb = kv_no_split.view(tokens, num_kv_heads, 1, kv_lora_rank + qk_rope_head_dim)
+        slot = torch.arange(fill, fill + tokens, dtype=torch.int64, device=kv_no_split.device)
+        torch_npu.npu_kv_rmsnorm_rope_cache(
+            kvb,
+            norm_weight,
+            cos,
+            sin,
+            slot,
+            self._db_k_pe[layer_id][active],
+            self._db_k_nope[layer_id][active],
+            epsilon=variance_epsilon,
+            cache_mode="PA",
+            is_output_kv=True
+        )
+        self._db_host_slots[layer_id][active][fill:fill + tokens] = host_slots.reshape(-1)
+        self._db_fill[layer_id] = fill + tokens
+
+    def flush_decode_double_buffer(self, layer_id: int) -> None:
+        """Flush a layer's remaining staged KV (e.g. at the end of a decode
+        session) and join the side stream so all host writes are visible."""
+        if not self.decode_double_buffer_enabled():
+            return
+        self._db_flush(layer_id)
+        if self.tp_rank == 0:
+            torch.npu.current_stream().wait_stream(self._db_stream)
+
+    def maybe_flush_decode_double_buffers(self, num_new_tokens: int) -> int:
+        """Pre-forward flush hook, invoked by the model runner BEFORE each
+        forward. For every layer, if its staged active cache already holds data
+        and cannot hold `num_new_tokens` more tokens this forward, flush it via
+        the ping-pong so exec_kv stages into a fresh cache.
+
+        Gating by ``fill + num_new_tokens > capacity`` preserves the batching
+        model (one D2H flush per ~capacity/step-tokens rather than per step).
+        Returns the number of layers actually flushed this call.
+        """
+        if not self.decode_double_buffer_enabled():
+            return 0
+        if not hasattr(self, "_db_active"):
+            return 0
+        flushed = 0
+        new_tokens = max(int(num_new_tokens), 1)
+        for layer_id in range(self.num_layers):
+            _active, fill = self._db_active_cache(layer_id)
+            if fill > 0 and fill + new_tokens > self._db_capacity:
+                self._db_flush(layer_id)
+                flushed += 1
+        return flushed
+
+    def rollback_decode_double_buffers(self, num_rejected: int) -> None:
+        """MTP adoption rollback: after sampling, `num_rejected` staged tokens of
+        the just-executed forward turned out to be rejected drafts)Skip. Drop them
+        from EVERY layer's active-cache tail (the ones staged last forward), and -
+        crucially - invalidate the corresponding `_db_host_slots` entries so a
+        later `_db_flush` (sparse_copy) never D2H's the rejected rows into the
+        host pool. Must run BEFORE the next forward's flush/stage; the rejected
+        rows are still in the active cache (not yet D2H)."""
+
+        if not self.decode_double_buffer_enabled() or num_rejected <= 0:
+            return
+        if not hasattr(self, "_db_active"):
+            return
+        for layer_id in range(self.num_layers):
+            active = self._db_active[layer_id]
+            n = min(int(num_rejected), self._db_fill[layer_id])  # defensive clamp
+            if n <= 0:
+                continue
+            self._db_fill[layer_id] -= n
+            slots = self._db_host_slots[layer_id][active]
+            slots[self._db_fill[layer_id]:self._db_fill[layer_id] + n] = -1
 
     def offload_new_kv(
         self,

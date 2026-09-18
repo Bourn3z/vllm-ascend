@@ -781,12 +781,22 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         attn_metadata: M,
     ):
         if self._is_decode_only(attn_metadata):
-            k_nope, k_pe = self._compute_kv_only(kv_no_split, cos, sin)
             manager = get_sparse_kv_offload_manager()
             layer_name = self._offload_layer_name()
-            k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
+            layer_id = manager._get_offload_layer_id(layer_name)
+            k_pe, k_nope = manager.offload_decode_kv_double_buffer(
+                layer_id=layer_id,
+                kv_no_split=kv_no_split,
+                norm_weight=self.kv_a_layernorm.weight,
+                cos=cos,
+                sin=sin,
+                host_slots=slots,
+                num_kv_heads=self.num_kv_heads,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                variance_epsilon=self.kv_a_layernorm.variance_epsilon,
+            )
             if attn_metadata.nano_enabled:
-                layer_id = manager._get_offload_layer_id(layer_name)
                 device_slots = attn_metadata.nano_device_slots
                 for cache_tensor, value in (
                     (manager.topk_buffers_k[layer_id], k_nope),
@@ -795,18 +805,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                     rows = cache_tensor.view(-1, cache_tensor.shape[-1])
                     rows.index_copy_(0, device_slots[: value.shape[0]], value.reshape(value.shape[0], -1))
                 slots = torch.where(attn_metadata.nano_token_active[: slots.numel()], slots, -1)
-            manager.offload_new_kv(
-                layer_name=layer_name,
-                slot_mapping=slots,
-                k_cache_cpu=k_cache_cpu,
-                v_cache_cpu=v_cache_cpu,
-                k_cache_npu=None,
-                v_cache_npu=None,
-                k=k_nope,
-                v=k_pe,
-                has_prefill=False,
-                capturing=self._in_graph_runtime(),
-            )
             return k_pe, k_nope
 
         # Prefill / mixed batch (colocate debug only): stage in the NPU paged
